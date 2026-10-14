@@ -19,13 +19,15 @@ public class KafkaProducerConfig {
 	@Value("${spring.kafka.bootstrap-servers}")
 	private String bootstrapServers;
 
+
+	//Creamos un ProducerFactory para UserRegisteredEvent, que se encargará de crear productores de Kafka con la configuración especificada.
 	@Bean
 	public ProducerFactory<String, UserRegisteredEvent> userRegisteredProducerFactory() {
 		Map<String, Object> props = new HashMap<>();
-		props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
-		props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
-		props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, JsonSerializer.class);
-		props.put(JsonSerializer.ADD_TYPE_INFO_HEADERS, false);
+		props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);// Configuramos la dirección del servidor Kafka
+		props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);// Configuramos el serializador para la clave del mensaje (String)
+		props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, JsonSerializer.class);// Configuramos el serializador para el valor del mensaje (UserRegisteredEvent)
+		props.put(JsonSerializer.ADD_TYPE_INFO_HEADERS, false);// Configuramos para no agregar información de tipo en los encabezados del mensaje
 		return new DefaultKafkaProducerFactory<>(props);
 	}
 

@@ -1,10 +1,9 @@
 package com.finnode.payment.service;
 
-import com.finnode.payment.dto.FraudEvaluationResult;
 import com.finnode.payment.dto.TransactionStatusResponse;
 import com.finnode.payment.dto.TransferRequest;
 import com.finnode.payment.dto.TransferResponse;
-import com.finnode.payment.exception.FraudDetectedException;
+import com.finnode.payment.exception.DuplicateTransactionException;
 import com.finnode.payment.exception.TransactionNotFoundException;
 import com.finnode.payment.model.SagaStep;
 import com.finnode.payment.model.Transaction;
@@ -18,6 +17,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -29,14 +29,17 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.*;
 
 /**
  * Pruebas unitarias de {@link PaymentService}.
  *
- * Se mockean TransactionRepository, FraudDetectionService y SagaOrchestrator
- * para aislar por completo la lógica de orquestación que vive en el servicio.
+ * El fraude ya NO se evalúa aquí (lo hace fraud-engine por Kafka): el servicio solo valida,
+ * aplica idempotencia, persiste la Transaction (PENDING / FRAUD_CHECK) y delega en
+ * SagaOrchestrator.requestFraudCheck(...).
+ *
+ * @InjectMocks construye el servicio con los mocks por tipo, así no depende del orden
+ * de los parámetros del constructor.
  */
 @ExtendWith(MockitoExtension.class)
 @DisplayName("PaymentService")
@@ -46,11 +49,9 @@ class PaymentServiceTest {
     private TransactionRepository transactionRepository;
 
     @Mock
-    private FraudDetectionService fraudDetectionService;
-
-    @Mock
     private SagaOrchestrator sagaOrchestrator;
 
+    @InjectMocks
     private PaymentService paymentService;
 
     private UUID userId;
@@ -60,8 +61,6 @@ class PaymentServiceTest {
 
     @BeforeEach
     void setUp() {
-        paymentService = new PaymentService(transactionRepository, fraudDetectionService, sagaOrchestrator);
-
         userId = UUID.randomUUID();
         sourceAccountId = UUID.randomUUID();
         destinationAccountId = UUID.randomUUID();
@@ -75,19 +74,32 @@ class PaymentServiceTest {
         );
     }
 
+    private Transaction existingTransaction(String idempotencyKey) {
+        Transaction tx = Transaction.builder()
+                .id(UUID.randomUUID())
+                .transactionId(UUID.randomUUID())
+                .userId(userId)
+                .sourceAccountId(sourceAccountId)
+                .destinationAccountId(destinationAccountId)
+                .amount(new BigDecimal("100000.00"))
+                .currency("COP")
+                .status(TransactionStatus.PENDING)
+                .currentStep(SagaStep.FRAUD_CHECK)
+                .build();
+        tx.setIdempotencyKey(idempotencyKey);
+        return tx;
+    }
+
     // ---------------------------------------------------------------
     // initiateTransfer
     // ---------------------------------------------------------------
 
     @Test
-    @DisplayName("Debe iniciar la transferencia cuando la evaluación de fraude aprueba la transacción")
-    void initiateTransfer_whenFraudCheckPasses_shouldPersistAndStartSaga() {
-        FraudEvaluationResult approvedResult = new FraudEvaluationResult(true, 0.12, "Riesgo bajo");
-
-        when(fraudDetectionService.evaluate(any(Transaction.class))).thenReturn(approvedResult);
+    @DisplayName("Debe persistir la transacción PENDING/FRAUD_CHECK y pedir la evaluación de fraude")
+    void initiateTransfer_shouldPersistAndRequestFraudCheck() {
         when(transactionRepository.save(any(Transaction.class))).thenAnswer(inv -> inv.getArgument(0));
 
-        TransferResponse response = paymentService.initiateTransfer(validRequest, userId);
+        TransferResponse response = paymentService.initiateTransfer(validRequest, userId, null);
 
         assertThat(response).isNotNull();
         assertThat(response.status()).isEqualTo(TransactionStatus.PENDING);
@@ -102,13 +114,23 @@ class PaymentServiceTest {
         assertThat(saved.getSourceAccountId()).isEqualTo(sourceAccountId);
         assertThat(saved.getDestinationAccountId()).isEqualTo(destinationAccountId);
         assertThat(saved.getStatus()).isEqualTo(TransactionStatus.PENDING);
+        assertThat(saved.getCurrentStep()).isEqualTo(SagaStep.FRAUD_CHECK);
 
-        verify(sagaOrchestrator).startSaga(saved);
-        verify(sagaOrchestrator, never()).rejectAsFraud(any(), anyDouble(), anyString());
+        verify(sagaOrchestrator).requestFraudCheck(saved);
     }
 
     @Test
-    @DisplayName("Debe rechazar la transferencia cuando source y destination son la misma cuenta")
+    @DisplayName("Sin Idempotency-Key no consulta el repositorio por clave")
+    void initiateTransfer_withoutKey_shouldNotLookUpIdempotency() {
+        when(transactionRepository.save(any(Transaction.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        paymentService.initiateTransfer(validRequest, userId, null);
+
+        verify(transactionRepository, never()).findByIdempotencyKey(any());
+    }
+
+    @Test
+    @DisplayName("Debe rechazar la transferencia cuando origen y destino son la misma cuenta")
     void initiateTransfer_whenSameAccount_shouldThrowIllegalArgumentException() {
         TransferRequest selfTransfer = new TransferRequest(
                 sourceAccountId.toString(),
@@ -118,48 +140,16 @@ class PaymentServiceTest {
                 "auto-transferencia"
         );
 
-        assertThatThrownBy(() -> paymentService.initiateTransfer(selfTransfer, userId))
+        assertThatThrownBy(() -> paymentService.initiateTransfer(selfTransfer, userId, null))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("misma cuenta");
 
-        verifyNoInteractions(fraudDetectionService, sagaOrchestrator);
+        verifyNoInteractions(sagaOrchestrator);
         verify(transactionRepository, never()).save(any());
     }
 
     @Test
-    @DisplayName("Debe persistir y rechazar por fraude, relanzando FraudDetectedException")
-    void initiateTransfer_whenFraudDetected_shouldPersistRejectAndRethrow() {
-        FraudDetectedException fraudException = new FraudDetectedException(0.91, "Monto atípico");
-
-        when(fraudDetectionService.evaluate(any(Transaction.class))).thenThrow(fraudException);
-        when(transactionRepository.save(any(Transaction.class))).thenAnswer(inv -> inv.getArgument(0));
-
-        assertThatThrownBy(() -> paymentService.initiateTransfer(validRequest, userId))
-                .isInstanceOf(FraudDetectedException.class)
-                .isSameAs(fraudException);
-
-        verify(transactionRepository).save(any(Transaction.class));
-        verify(sagaOrchestrator).rejectAsFraud(any(Transaction.class), eq(0.91), eq("Monto atípico"));
-        verify(sagaOrchestrator, never()).startSaga(any());
-    }
-
-    @Test
-    @DisplayName("Debe envolver cualquier error inesperado en RuntimeException")
-    void initiateTransfer_whenUnexpectedError_shouldWrapInRuntimeException() {
-        when(fraudDetectionService.evaluate(any(Transaction.class)))
-                .thenThrow(new IllegalStateException("Fallo de conexión con el modelo de IA"));
-
-        assertThatThrownBy(() -> paymentService.initiateTransfer(validRequest, userId))
-                .isInstanceOf(RuntimeException.class)
-                .hasMessageContaining("Error iniciando transferencia")
-                .hasCauseInstanceOf(IllegalStateException.class);
-
-        verify(sagaOrchestrator, never()).startSaga(any());
-        verify(sagaOrchestrator, never()).rejectAsFraud(any(), anyDouble(), anyString());
-    }
-
-    @Test
-    @DisplayName("El mensaje de dominio inválido en sourceAccountId debe propagar IllegalArgumentException")
+    @DisplayName("Un sourceAccountId que no es UUID debe propagar IllegalArgumentException")
     void initiateTransfer_whenAccountIdIsNotUuid_shouldThrowIllegalArgumentException() {
         TransferRequest malformed = new TransferRequest(
                 "no-es-un-uuid",
@@ -169,10 +159,81 @@ class PaymentServiceTest {
                 null
         );
 
-        assertThatThrownBy(() -> paymentService.initiateTransfer(malformed, userId))
+        assertThatThrownBy(() -> paymentService.initiateTransfer(malformed, userId, null))
                 .isInstanceOf(IllegalArgumentException.class);
 
-        verifyNoInteractions(fraudDetectionService, sagaOrchestrator);
+        verifyNoInteractions(sagaOrchestrator);
+        verify(transactionRepository, never()).save(any());
+    }
+
+    // ---------------------------------------------------------------
+    // Idempotencia
+    // ---------------------------------------------------------------
+
+    @Test
+    @DisplayName("Con una clave nueva guarda la clave en la transacción y crea el pago")
+    void initiateTransfer_withNewKey_shouldStoreKeyAndCreatePayment() {
+        when(transactionRepository.findByIdempotencyKey("key-nueva")).thenReturn(Optional.empty());
+        when(transactionRepository.save(any(Transaction.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        paymentService.initiateTransfer(validRequest, userId, "key-nueva");
+
+        ArgumentCaptor<Transaction> txCaptor = ArgumentCaptor.forClass(Transaction.class);
+        verify(transactionRepository).save(txCaptor.capture());
+        assertThat(txCaptor.getValue().getIdempotencyKey()).isEqualTo("key-nueva");
+        verify(sagaOrchestrator).requestFraudCheck(txCaptor.getValue());
+    }
+
+    @Test
+    @DisplayName("Misma clave y misma solicitud: devuelve la transacción original sin crear otra")
+    void initiateTransfer_withSameKeyAndSameRequest_shouldReturnOriginal() {
+        Transaction original = existingTransaction("key-1");
+        when(transactionRepository.findByIdempotencyKey("key-1")).thenReturn(Optional.of(original));
+
+        TransferResponse response = paymentService.initiateTransfer(validRequest, userId, "key-1");
+
+        assertThat(response.transactionId()).isEqualTo(original.getTransactionId().toString());
+        verify(transactionRepository, never()).save(any());
+        verifyNoInteractions(sagaOrchestrator);
+    }
+
+    @Test
+    @DisplayName("Misma clave con otro monto: DuplicateTransactionException (409)")
+    void initiateTransfer_withSameKeyButDifferentAmount_shouldThrowDuplicate() {
+        Transaction original = existingTransaction("key-1");
+        original.setAmount(new BigDecimal("999.00"));
+        when(transactionRepository.findByIdempotencyKey("key-1")).thenReturn(Optional.of(original));
+
+        assertThatThrownBy(() -> paymentService.initiateTransfer(validRequest, userId, "key-1"))
+                .isInstanceOf(DuplicateTransactionException.class);
+
+        verify(transactionRepository, never()).save(any());
+        verifyNoInteractions(sagaOrchestrator);
+    }
+
+    @Test
+    @DisplayName("Misma clave con otra cuenta destino: DuplicateTransactionException (409)")
+    void initiateTransfer_withSameKeyButDifferentDestination_shouldThrowDuplicate() {
+        Transaction original = existingTransaction("key-1");
+        original.setDestinationAccountId(UUID.randomUUID());
+        when(transactionRepository.findByIdempotencyKey("key-1")).thenReturn(Optional.of(original));
+
+        assertThatThrownBy(() -> paymentService.initiateTransfer(validRequest, userId, "key-1"))
+                .isInstanceOf(DuplicateTransactionException.class);
+    }
+
+    @Test
+    @DisplayName("Clave ya usada por otro usuario: DuplicateTransactionException (409)")
+    void initiateTransfer_withKeyUsedByAnotherUser_shouldThrowDuplicate() {
+        Transaction original = existingTransaction("key-1");
+        original.setUserId(UUID.randomUUID());
+        when(transactionRepository.findByIdempotencyKey("key-1")).thenReturn(Optional.of(original));
+
+        assertThatThrownBy(() -> paymentService.initiateTransfer(validRequest, userId, "key-1"))
+                .isInstanceOf(DuplicateTransactionException.class);
+
+        verify(transactionRepository, never()).save(any());
+        verifyNoInteractions(sagaOrchestrator);
     }
 
     // ---------------------------------------------------------------
@@ -192,7 +253,7 @@ class PaymentServiceTest {
                 .currency("USD")
                 .status(TransactionStatus.FUNDS_RESERVED)
                 .currentStep(SagaStep.RECORD_LEDGER)
-                .fraudRiskScore(0.2)
+                .fraudRiskScore(20.0)
                 .build();
 
         when(transactionRepository.findByTransactionId(transactionId)).thenReturn(Optional.of(transaction));
@@ -202,7 +263,34 @@ class PaymentServiceTest {
         assertThat(response.transactionId()).isEqualTo(transactionId.toString());
         assertThat(response.status()).isEqualTo(TransactionStatus.FUNDS_RESERVED);
         assertThat(response.currentStep()).isEqualTo(SagaStep.RECORD_LEDGER);
-        assertThat(response.fraudRiskScore()).isEqualTo(0.2);
+        assertThat(response.fraudRiskScore()).isEqualTo(20.0);
+        assertThat(response.failureReason()).isNull();
+    }
+
+    @Test
+    @DisplayName("Debe exponer el motivo de fallo cuando fue rechazada por fraude")
+    void getTransactionStatus_whenFraudRejected_shouldExposeReason() {
+        UUID transactionId = UUID.randomUUID();
+        Transaction transaction = Transaction.builder()
+                .transactionId(transactionId)
+                .userId(userId)
+                .sourceAccountId(sourceAccountId)
+                .destinationAccountId(destinationAccountId)
+                .amount(new BigDecimal("200.00"))
+                .currency("USD")
+                .status(TransactionStatus.FRAUD_REJECTED)
+                .currentStep(SagaStep.FRAUD_CHECK)
+                .fraudRiskScore(85.0)
+                .failureReason("FRAUD_REJECTED:NEW_BENEFICIARY_HIGH_AMOUNT")
+                .build();
+
+        when(transactionRepository.findByTransactionId(transactionId)).thenReturn(Optional.of(transaction));
+
+        TransactionStatusResponse response = paymentService.getTransactionStatus(transactionId);
+
+        assertThat(response.status()).isEqualTo(TransactionStatus.FRAUD_REJECTED);
+        assertThat(response.fraudRiskScore()).isEqualTo(85.0);
+        assertThat(response.failureReason()).isEqualTo("FRAUD_REJECTED:NEW_BENEFICIARY_HIGH_AMOUNT");
     }
 
     @Test
@@ -258,9 +346,7 @@ class PaymentServiceTest {
     void getUserTransactionHistory_whenEmpty_shouldReturnEmptyList() {
         when(transactionRepository.findByUserIdOrderByCreatedAtDesc(userId)).thenReturn(List.of());
 
-        List<TransactionStatusResponse> history = paymentService.getUserTransactionHistory(userId);
-
-        assertThat(history).isEmpty();
+        assertThat(paymentService.getUserTransactionHistory(userId)).isEmpty();
     }
 
     // ---------------------------------------------------------------

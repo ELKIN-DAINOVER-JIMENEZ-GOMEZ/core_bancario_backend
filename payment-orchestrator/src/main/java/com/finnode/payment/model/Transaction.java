@@ -14,6 +14,7 @@ import java.util.UUID;
         name = "transactions",
         indexes = {
                 @Index(name = "idx_transactions_transaction_id", columnList = "transaction_id", unique = true),
+                @Index(name = "idx_transactions_idempotency_key", columnList = "idempotency_key", unique = true),
                 @Index(name = "idx_transactions_user_id",        columnList = "user_id"),
                 @Index(name = "idx_transactions_status",         columnList = "status"),
                 @Index(name = "idx_transactions_user_created",   columnList = "user_id, created_at")
@@ -40,6 +41,15 @@ public class Transaction {
     @Column(name = "transaction_id", nullable = false, unique = true, updatable = false)
     private UUID transactionId;
 
+    /**
+     * Valor de la cabecera Idempotency-Key enviada por el cliente.
+     * Evita crear dos pagos cuando el cliente reintenta la misma solicitud.
+     * Es opcional (null si el cliente no la envía); PostgreSQL permite varios NULL
+     * en una columna única, por lo que solo se restringen las claves repetidas.
+     */
+    @Column(name = "idempotency_key", length = 64, unique = true, updatable = false)
+    private String idempotencyKey;
+
     /** Referencia lógica al usuario que inicia el pago (proviene del JWT). */
     @Column(name = "user_id", nullable = false, updatable = false)
     private UUID userId;
@@ -63,8 +73,9 @@ public class Transaction {
     /**
      * Estado actual de la transacción en el flujo del Saga.
      * Transiciones válidas:
-     *   PENDING → FRAUD_REJECTED (terminal)
-     *   PENDING → FUNDS_RESERVED → LEDGER_RECORDED → COMPLETED (terminal exitoso)
+     *   PENDING (FRAUD_CHECK) → FRAUD_REJECTED (terminal, fraude rechazado)
+     *   PENDING (FRAUD_CHECK) → PENDING (RESERVE_FUNDS) (fraude aprobado)
+     *   PENDING → FUNDS_RESERVED → COMPLETED (terminal exitoso)
      *   PENDING → FAILED (terminal, sin fondos reservados)
      *   FUNDS_RESERVED → REVERSED (terminal, con compensación)
      */
@@ -82,16 +93,18 @@ public class Transaction {
     private SagaStep currentStep;
 
     /**
-     * Score de riesgo devuelto por el motor de Spring AI (rango: 0.0 – 1.0).
+     * Score de riesgo devuelto por fraud-engine en fraud.check-completed
+     * (la escala la define fraud-engine; en el contrato actual es 0 – 100).
      * Se persiste siempre, incluso para pagos aprobados, para análisis histórico.
-     * Null si la evaluación de fraude no pudo completarse.
+     * Null mientras fraud-engine no ha respondido.
      */
     @Column(name = "fraud_risk_score")
     private Double fraudRiskScore;
 
     /**
      * Motivo del fallo si el Saga no llegó a COMPLETED.
-     * Ejemplos: "INSUFFICIENT_FUNDS", "LEDGER_RECORDING_TIMEOUT", "FRAUD_DETECTED".
+     * Ejemplos: "INSUFFICIENT_FUNDS", "LEDGER_RECORDING_TIMEOUT",
+     * "FRAUD_REJECTED:UNUSUAL_HOUR,NEW_BENEFICIARY_HIGH_AMOUNT" (motivo + códigos de reglas).
      */
     @Column(name = "failure_reason", length = 500)
     private String failureReason;

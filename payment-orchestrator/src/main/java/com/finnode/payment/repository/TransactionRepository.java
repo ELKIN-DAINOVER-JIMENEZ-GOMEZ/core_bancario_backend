@@ -22,6 +22,7 @@ import java.util.UUID;
 public interface TransactionRepository extends JpaRepository<Transaction, UUID> {
 
     Optional<Transaction> findByTransactionId(UUID transactionId);
+    Optional<Transaction> findByIdempotencyKey(String idempotencyKey);
 
     List<Transaction> findByUserId(UUID userId);
 

@@ -1,5 +1,7 @@
 package com.finnode.payment.kafka;
 
+import com.finnode.payment.event.FraudCheckCompletedEvent;
+import com.finnode.payment.event.FundsReleasedEvent;
 import com.finnode.payment.event.FundsReservationFailedEvent;
 import com.finnode.payment.event.FundsReservedEvent;
 import com.finnode.payment.event.LedgerEntriesRecordedEvent;
@@ -14,10 +16,12 @@ import org.springframework.stereotype.Service;
  * Consumidor de eventos para el Saga de pagos.
  *
  * Escucha los topics de response de otros microservicios:
- *  - account.funds-reserved       → FundsReservedEvent
+ *  - fraud.check-completed            → FraudCheckCompletedEvent (fraud-engine)
+ *  - account.funds-reserved           → FundsReservedEvent
  *  - account.funds-reservation-failed → FundsReservationFailedEvent
- *  - ledger.entries-recorded      → LedgerEntriesRecordedEvent
- *  - ledger.recording-failed      → LedgerRecordingFailedEvent (compensación)
+ *  - account.funds-released           → FundsReleasedEvent (confirma la compensación)
+ *  - ledger.entries-recorded          → LedgerEntriesRecordedEvent
+ *  - ledger.recording-failed          → LedgerRecordingFailedEvent (compensación)
  *
  * Al recibir cada evento, llama a SagaOrchestrator para avanzar, revertir
  * o completar el flujo según corresponda.
@@ -28,6 +32,33 @@ import org.springframework.stereotype.Service;
 public class PaymentEventConsumer {
 
     private final SagaOrchestrator sagaOrchestrator;
+
+    /**
+     * Escucha la decisión del motor de fraude.
+     *
+     * Topic: fraud.check-completed
+     * Origen: fraud-engine (Python / FastAPI)
+     *
+     * Transición: PENDING (FRAUD_CHECK) → PENDING (RESERVE_FUNDS) si APPROVED
+     *             PENDING (FRAUD_CHECK) → FRAUD_REJECTED si REJECTED
+     * Acción: APPROVED → publicar payment.initiated (reserva de fondos);
+     *         REJECTED → publicar payment.failed y notificar al usuario
+     */
+    @KafkaListener(
+            topics = "fraud.check-completed",
+            groupId = "payment-orchestrator-group",
+            containerFactory = "kafkaListenerContainerFactory"
+    )
+    public void onFraudCheckCompleted(FraudCheckCompletedEvent event) {
+        log.info("Received FraudCheckCompletedEvent for transaction: {}, decision: {}, riskScore: {}",
+                event.transactionId(), event.decision(), event.riskScore());
+        try {
+            sagaOrchestrator.onFraudCheckCompleted(event);
+        } catch (Exception e) {
+            log.error("Error processing FraudCheckCompletedEvent: {}", event, e);
+            // En producción, enviar a DLQ o reintentarlo
+        }
+    }
 
     /**
      * Escucha eventos de reserva de fondos exitosa.
@@ -74,6 +105,31 @@ public class PaymentEventConsumer {
             sagaOrchestrator.onFundsReservationFailed(event);
         } catch (Exception e) {
             log.error("Error processing FundsReservationFailedEvent: {}", event, e);
+            // En producción, enviar a DLQ o reintentarlo
+        }
+    }
+
+    /**
+     * Escucha la confirmación de liberación de fondos (fin de la compensación).
+     *
+     * Topic: account.funds-released
+     * Origen: account-service
+     *
+     * Se publica cuando account-service procesó payment.reversed y liberó la reserva.
+     * Estado: REVERSED (sin cambio)
+     * Acción: Publicar payment.failed y notificar al usuario que el pago fue revertido
+     */
+    @KafkaListener(
+            topics = "account.funds-released",
+            groupId = "payment-orchestrator-group",
+            containerFactory = "kafkaListenerContainerFactory"
+    )
+    public void onFundsReleased(FundsReleasedEvent event) {
+        log.info("Received FundsReleasedEvent for transaction: {}", event.transactionId());
+        try {
+            sagaOrchestrator.onFundsReleased(event);
+        } catch (Exception e) {
+            log.error("Error processing FundsReleasedEvent: {}", event, e);
             // En producción, enviar a DLQ o reintentarlo
         }
     }
@@ -128,5 +184,3 @@ public class PaymentEventConsumer {
         }
     }
 }
-
-

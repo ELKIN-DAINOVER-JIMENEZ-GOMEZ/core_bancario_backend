@@ -9,16 +9,22 @@ import com.finnode.payment.model.SagaStep;
 import com.finnode.payment.model.Transaction;
 import com.finnode.payment.model.TransactionStatus;
 import com.finnode.payment.repository.TransactionRepository;
+import com.finnode.payment.websocket.PaymentNotificationHandler;
 
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -28,17 +34,20 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.*;
 
 /**
- * Pruebas unitarias de {@link SagaOrchestrator}.
+ * Pruebas unitarias de {@link SagaOrchestrator}: transiciones que usan eventos con contrato
+ * conocido (reserva de fondos, ledger y compensación). El flujo de fraude y
+ * account.funds-released está en {@link SagaOrchestratorFraudFlowTest}.
  *
- * Campos reales confirmados de los eventos (com.finnode.payment.event):
+ * Los eventos de Kafka y WebSocket se emiten DESPUÉS del commit. Para simularlo sin base de datos
+ * se activa la sincronización de transacciones de Spring en cada test y {@link #commit()}
+ * dispara los afterCommit registrados. Si la implementación ejecuta la acción de inmediato,
+ * commit() simplemente no encuentra nada que disparar.
+ *
+ * Campos reales de los eventos (com.finnode.payment.event):
  *   - FundsReservedEvent(UUID transactionId, UUID accountId, BigDecimal amount, Instant timestamp)
  *   - FundsReservationFailedEvent(UUID transactionId, UUID accountId, String reason, Instant timestamp)
  *   - LedgerEntriesRecordedEvent(UUID transactionId, UUID debitEntryId, UUID creditEntryId,
  *       BigDecimal amount, String currency, boolean reversalConfirmed, Instant timestamp)
- * Y de PaymentEventPublisher (com.finnode.payment.kafka):
- *   - publishPaymentCompleted(transactionId, sourceAccountId, destinationAccountId, amount, currency)
- *   - publishPaymentReversed(transactionId, sourceAccountId, destinationAccountId, amount, currency, reason)
- *   - publishPaymentInitiated(transactionId, sourceAccountId, amount, currency)
  */
 @ExtendWith(MockitoExtension.class)
 @DisplayName("SagaOrchestrator")
@@ -50,6 +59,10 @@ class SagaOrchestratorTest {
     @Mock
     private PaymentEventPublisher paymentEventPublisher;
 
+    @Mock
+    private PaymentNotificationHandler notificationHandler;
+
+    @InjectMocks
     private SagaOrchestrator sagaOrchestrator;
 
     private Transaction transaction;
@@ -57,7 +70,7 @@ class SagaOrchestratorTest {
 
     @BeforeEach
     void setUp() {
-        sagaOrchestrator = new SagaOrchestrator(transactionRepository, paymentEventPublisher);
+        TransactionSynchronizationManager.initSynchronization();
 
         transactionId = UUID.randomUUID();
         transaction = Transaction.builder()
@@ -72,23 +85,70 @@ class SagaOrchestratorTest {
                 .build();
     }
 
+    @AfterEach
+    void tearDown() {
+        TransactionSynchronizationManager.clearSynchronization();
+    }
+
+    /** Simula el commit de la transacción: ejecuta los afterCommit registrados. */
+    private void commit() {
+        new ArrayList<>(TransactionSynchronizationManager.getSynchronizations())
+                .forEach(TransactionSynchronization::afterCommit);
+    }
+
+    private LedgerEntriesRecordedEvent ledgerEvent() {
+        return new LedgerEntriesRecordedEvent(
+                transactionId, UUID.randomUUID(), UUID.randomUUID(),
+                transaction.getAmount(), transaction.getCurrency(), false, Instant.now());
+    }
+
+    // ---------------------------------------------------------------
+    // startSaga (fraude aprobado → pedir reserva de fondos)
+    // ---------------------------------------------------------------
+
+    @Test
+    @DisplayName("startSaga: fija PENDING/RESERVE_FUNDS y publica PaymentInitiatedEvent tras el commit")
+    void startSaga_shouldSetStepAndPublishInitiatedEventAfterCommit() {
+        transaction.setCurrentStep(SagaStep.FRAUD_CHECK);
+
+        sagaOrchestrator.startSaga(transaction);
+
+        assertThat(transaction.getStatus()).isEqualTo(TransactionStatus.PENDING);
+        assertThat(transaction.getCurrentStep()).isEqualTo(SagaStep.RESERVE_FUNDS);
+        verify(transactionRepository).save(transaction);
+
+        // Aún no hubo commit: no debe haberse publicado nada
+        verifyNoInteractions(paymentEventPublisher);
+
+        commit();
+
+        verify(paymentEventPublisher).publishPaymentInitiated(
+                transaction.getTransactionId(),
+                transaction.getSourceAccountId(),
+                transaction.getAmount(),
+                transaction.getCurrency()
+        );
+    }
+
     // ---------------------------------------------------------------
     // onFundsReserved
     // ---------------------------------------------------------------
 
     @Test
-    @DisplayName("Debe avanzar a FUNDS_RESERVED y publicar el evento de ledger cuando la transacción está PENDING")
-    void onFundsReserved_whenPending_shouldAdvanceAndPublish() {
+    @DisplayName("onFundsReserved: PENDING/RESERVE_FUNDS → FUNDS_RESERVED/RECORD_LEDGER y publica payment.completed")
+    void onFundsReserved_whenPending_shouldAdvanceAndPublishAfterCommit() {
         when(transactionRepository.findByTransactionId(transactionId)).thenReturn(Optional.of(transaction));
 
-        FundsReservedEvent event = new FundsReservedEvent(
-                transactionId, transaction.getSourceAccountId(), transaction.getAmount(), Instant.now());
-        sagaOrchestrator.onFundsReserved(event);
+        sagaOrchestrator.onFundsReserved(new FundsReservedEvent(
+                transactionId, transaction.getSourceAccountId(), transaction.getAmount(), Instant.now()));
 
         assertThat(transaction.getStatus()).isEqualTo(TransactionStatus.FUNDS_RESERVED);
         assertThat(transaction.getCurrentStep()).isEqualTo(SagaStep.RECORD_LEDGER);
-
         verify(transactionRepository).save(transaction);
+        verifyNoInteractions(paymentEventPublisher);
+
+        commit();
+
         verify(paymentEventPublisher).publishPaymentCompleted(
                 transactionId,
                 transaction.getSourceAccountId(),
@@ -99,21 +159,36 @@ class SagaOrchestratorTest {
     }
 
     @Test
-    @DisplayName("Debe ignorar FundsReservedEvent si la transacción no está en PENDING (idempotencia)")
+    @DisplayName("onFundsReserved: se ignora si la transacción ya no está en PENDING (idempotencia)")
     void onFundsReserved_whenNotPending_shouldBeIgnored() {
         transaction.setStatus(TransactionStatus.FUNDS_RESERVED);
         when(transactionRepository.findByTransactionId(transactionId)).thenReturn(Optional.of(transaction));
 
-        FundsReservedEvent event = new FundsReservedEvent(
-                transactionId, transaction.getSourceAccountId(), transaction.getAmount(), Instant.now());
-        sagaOrchestrator.onFundsReserved(event);
+        sagaOrchestrator.onFundsReserved(new FundsReservedEvent(
+                transactionId, transaction.getSourceAccountId(), transaction.getAmount(), Instant.now()));
+        commit();
 
         verify(transactionRepository, never()).save(any());
         verifyNoInteractions(paymentEventPublisher);
     }
 
     @Test
-    @DisplayName("Debe lanzar PaymentProcessingException si la transacción no existe")
+    @DisplayName("onFundsReserved: se ignora si el paso no es RESERVE_FUNDS (p. ej. aún en FRAUD_CHECK)")
+    void onFundsReserved_whenStepIsFraudCheck_shouldBeIgnored() {
+        transaction.setCurrentStep(SagaStep.FRAUD_CHECK);
+        when(transactionRepository.findByTransactionId(transactionId)).thenReturn(Optional.of(transaction));
+
+        sagaOrchestrator.onFundsReserved(new FundsReservedEvent(
+                transactionId, transaction.getSourceAccountId(), transaction.getAmount(), Instant.now()));
+        commit();
+
+        assertThat(transaction.getStatus()).isEqualTo(TransactionStatus.PENDING);
+        verify(transactionRepository, never()).save(any());
+        verifyNoInteractions(paymentEventPublisher);
+    }
+
+    @Test
+    @DisplayName("onFundsReserved: lanza PaymentProcessingException si la transacción no existe")
     void onFundsReserved_whenTransactionNotFound_shouldThrow() {
         when(transactionRepository.findByTransactionId(transactionId)).thenReturn(Optional.empty());
 
@@ -131,32 +206,36 @@ class SagaOrchestratorTest {
     // ---------------------------------------------------------------
 
     @Test
-    @DisplayName("Debe marcar la transacción como FAILED sin publicar compensación")
+    @DisplayName("onFundsReservationFailed: PENDING → FAILED/COMPENSATE con el motivo, sin publicar compensación")
     void onFundsReservationFailed_whenPending_shouldMarkFailed() {
         when(transactionRepository.findByTransactionId(transactionId)).thenReturn(Optional.of(transaction));
 
-        FundsReservationFailedEvent event = new FundsReservationFailedEvent(
-                transactionId, transaction.getSourceAccountId(), "Saldo insuficiente", Instant.now());
-        sagaOrchestrator.onFundsReservationFailed(event);
+        sagaOrchestrator.onFundsReservationFailed(new FundsReservationFailedEvent(
+                transactionId, transaction.getSourceAccountId(), "Saldo insuficiente", Instant.now()));
+        commit();
 
         assertThat(transaction.getStatus()).isEqualTo(TransactionStatus.FAILED);
         assertThat(transaction.getCurrentStep()).isEqualTo(SagaStep.COMPENSATE);
         assertThat(transaction.getFailureReason()).isEqualTo("Saldo insuficiente");
-
         verify(transactionRepository).save(transaction);
-        verifyNoInteractions(paymentEventPublisher);
+
+        // Nada que revertir: no se completa ni se revierte; solo se informa (payment.failed)
+        verify(paymentEventPublisher, never()).publishPaymentInitiated(any(), any(), any(), any());
+        verify(paymentEventPublisher, never()).publishPaymentCompleted(any(), any(), any(), any(), any());
+        verify(paymentEventPublisher, never()).publishPaymentReversed(any(), any(), any(), any(), any(), any());
     }
 
     @Test
-    @DisplayName("Debe ignorar FundsReservationFailedEvent si la transacción no está en PENDING")
+    @DisplayName("onFundsReservationFailed: se ignora si la transacción no está en PENDING")
     void onFundsReservationFailed_whenNotPending_shouldBeIgnored() {
         transaction.setStatus(TransactionStatus.COMPLETED);
         when(transactionRepository.findByTransactionId(transactionId)).thenReturn(Optional.of(transaction));
 
-        FundsReservationFailedEvent event = new FundsReservationFailedEvent(
-                transactionId, transaction.getSourceAccountId(), "irrelevante", Instant.now());
-        sagaOrchestrator.onFundsReservationFailed(event);
+        sagaOrchestrator.onFundsReservationFailed(new FundsReservationFailedEvent(
+                transactionId, transaction.getSourceAccountId(), "irrelevante", Instant.now()));
+        commit();
 
+        assertThat(transaction.getStatus()).isEqualTo(TransactionStatus.COMPLETED);
         verify(transactionRepository, never()).save(any());
     }
 
@@ -165,21 +244,14 @@ class SagaOrchestratorTest {
     // ---------------------------------------------------------------
 
     @Test
-    @DisplayName("Debe completar la transacción cuando estaba en FUNDS_RESERVED")
+    @DisplayName("onLedgerRecorded: FUNDS_RESERVED → COMPLETED/CONFIRM_PAYMENT")
     void onLedgerRecorded_whenFundsReserved_shouldComplete() {
         transaction.setStatus(TransactionStatus.FUNDS_RESERVED);
+        transaction.setCurrentStep(SagaStep.RECORD_LEDGER);
         when(transactionRepository.findByTransactionId(transactionId)).thenReturn(Optional.of(transaction));
 
-        LedgerEntriesRecordedEvent event = new LedgerEntriesRecordedEvent(
-                transactionId,
-                UUID.randomUUID(),
-                UUID.randomUUID(),
-                transaction.getAmount(),
-                transaction.getCurrency(),
-                false,
-                Instant.now()
-        );
-        sagaOrchestrator.onLedgerRecorded(event);
+        sagaOrchestrator.onLedgerRecorded(ledgerEvent());
+        commit();
 
         assertThat(transaction.getStatus()).isEqualTo(TransactionStatus.COMPLETED);
         assertThat(transaction.getCurrentStep()).isEqualTo(SagaStep.CONFIRM_PAYMENT);
@@ -187,22 +259,15 @@ class SagaOrchestratorTest {
     }
 
     @Test
-    @DisplayName("Debe ignorar LedgerEntriesRecordedEvent si la transacción no está en FUNDS_RESERVED")
+    @DisplayName("onLedgerRecorded: se ignora si la transacción no está en FUNDS_RESERVED")
     void onLedgerRecorded_whenNotFundsReserved_shouldBeIgnored() {
         transaction.setStatus(TransactionStatus.PENDING);
         when(transactionRepository.findByTransactionId(transactionId)).thenReturn(Optional.of(transaction));
 
-        LedgerEntriesRecordedEvent event = new LedgerEntriesRecordedEvent(
-                transactionId,
-                UUID.randomUUID(),
-                UUID.randomUUID(),
-                transaction.getAmount(),
-                transaction.getCurrency(),
-                false,
-                Instant.now()
-        );
-        sagaOrchestrator.onLedgerRecorded(event);
+        sagaOrchestrator.onLedgerRecorded(ledgerEvent());
+        commit();
 
+        assertThat(transaction.getStatus()).isEqualTo(TransactionStatus.PENDING);
         verify(transactionRepository, never()).save(any());
     }
 
@@ -211,9 +276,10 @@ class SagaOrchestratorTest {
     // ---------------------------------------------------------------
 
     @Test
-    @DisplayName("Debe revertir la transacción y publicar el evento de reversión cuando estaba FUNDS_RESERVED")
-    void compensateTransaction_whenFundsReserved_shouldReverseAndPublish() {
+    @DisplayName("compensateTransaction: FUNDS_RESERVED → REVERSED/COMPENSATE y publica payment.reversed tras el commit")
+    void compensateTransaction_whenFundsReserved_shouldReverseAndPublishAfterCommit() {
         transaction.setStatus(TransactionStatus.FUNDS_RESERVED);
+        transaction.setCurrentStep(SagaStep.RECORD_LEDGER);
         when(transactionRepository.findByTransactionId(transactionId)).thenReturn(Optional.of(transaction));
 
         sagaOrchestrator.compensateTransaction(transactionId.toString(), "Timeout en ledger-service");
@@ -221,8 +287,11 @@ class SagaOrchestratorTest {
         assertThat(transaction.getStatus()).isEqualTo(TransactionStatus.REVERSED);
         assertThat(transaction.getCurrentStep()).isEqualTo(SagaStep.COMPENSATE);
         assertThat(transaction.getFailureReason()).isEqualTo("Timeout en ledger-service");
-
         verify(transactionRepository).save(transaction);
+        verifyNoInteractions(paymentEventPublisher);
+
+        commit();
+
         verify(paymentEventPublisher).publishPaymentReversed(
                 transactionId,
                 transaction.getSourceAccountId(),
@@ -234,12 +303,13 @@ class SagaOrchestratorTest {
     }
 
     @Test
-    @DisplayName("No debe compensar (ni publicar) si los fondos nunca fueron reservados")
+    @DisplayName("compensateTransaction: no compensa (ni publica) si los fondos nunca fueron reservados")
     void compensateTransaction_whenNotFundsReserved_shouldDoNothing() {
         transaction.setStatus(TransactionStatus.PENDING);
         when(transactionRepository.findByTransactionId(transactionId)).thenReturn(Optional.of(transaction));
 
         sagaOrchestrator.compensateTransaction(transactionId.toString(), "cualquier razón");
+        commit();
 
         assertThat(transaction.getStatus()).isEqualTo(TransactionStatus.PENDING);
         verify(transactionRepository, never()).save(any());
@@ -247,51 +317,26 @@ class SagaOrchestratorTest {
     }
 
     @Test
-    @DisplayName("Debe lanzar PaymentProcessingException si la transacción a compensar no existe")
+    @DisplayName("compensateTransaction: una segunda compensación (ya REVERSED) no vuelve a publicar")
+    void compensateTransaction_whenAlreadyReversed_shouldNotPublishAgain() {
+        transaction.setStatus(TransactionStatus.REVERSED);
+        transaction.setCurrentStep(SagaStep.COMPENSATE);
+        when(transactionRepository.findByTransactionId(transactionId)).thenReturn(Optional.of(transaction));
+
+        sagaOrchestrator.compensateTransaction(transactionId.toString(), "duplicado");
+        commit();
+
+        verify(transactionRepository, never()).save(any());
+        verifyNoInteractions(paymentEventPublisher);
+    }
+
+    @Test
+    @DisplayName("compensateTransaction: lanza PaymentProcessingException si la transacción no existe")
     void compensateTransaction_whenTransactionNotFound_shouldThrow() {
         when(transactionRepository.findByTransactionId(transactionId)).thenReturn(Optional.empty());
 
         assertThatThrownBy(() ->
                 sagaOrchestrator.compensateTransaction(transactionId.toString(), "razón"))
                 .isInstanceOf(PaymentProcessingException.class);
-    }
-
-    // ---------------------------------------------------------------
-    // rejectAsFraud
-    // ---------------------------------------------------------------
-
-    @Test
-    @DisplayName("Debe marcar la transacción como FRAUD_REJECTED con el score y la razón dados")
-    void rejectAsFraud_shouldMarkTransactionAsFraudRejected() {
-        sagaOrchestrator.rejectAsFraud(transaction, 0.95, "Patrón de fraude detectado");
-
-        assertThat(transaction.getStatus()).isEqualTo(TransactionStatus.FRAUD_REJECTED);
-        assertThat(transaction.getCurrentStep()).isEqualTo(SagaStep.FRAUD_CHECK);
-        assertThat(transaction.getFraudRiskScore()).isEqualTo(0.95);
-        assertThat(transaction.getFailureReason()).isEqualTo("Patrón de fraude detectado");
-
-        verify(transactionRepository).save(transaction);
-        verifyNoInteractions(paymentEventPublisher);
-    }
-
-    // ---------------------------------------------------------------
-    // startSaga
-    // ---------------------------------------------------------------
-
-    @Test
-    @DisplayName("Debe fijar el estado PENDING/RESERVE_FUNDS y publicar PaymentInitiatedEvent")
-    void startSaga_shouldSetStepAndPublishInitiatedEvent() {
-        sagaOrchestrator.startSaga(transaction);
-
-        assertThat(transaction.getStatus()).isEqualTo(TransactionStatus.PENDING);
-        assertThat(transaction.getCurrentStep()).isEqualTo(SagaStep.RESERVE_FUNDS);
-
-        verify(transactionRepository).save(transaction);
-        verify(paymentEventPublisher).publishPaymentInitiated(
-                transaction.getTransactionId(),
-                transaction.getSourceAccountId(),
-                transaction.getAmount(),
-                transaction.getCurrency()
-        );
     }
 }

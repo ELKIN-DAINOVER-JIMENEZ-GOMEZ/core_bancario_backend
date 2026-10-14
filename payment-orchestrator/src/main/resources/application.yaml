@@ -20,7 +20,9 @@ spring:
   # ── JPA / HIBERNATE ────────────────────────────────────────────────────────
   jpa:
     hibernate:
-      ddl-auto: ${JPA_DDL_AUTO:update}   # 'validate' en prod, 'update' en dev
+      # 'update' en dev crea solo la columna/índice nuevos (transactions.idempotency_key).
+      # En prod usar 'validate' y aplicar la migración SQL antes de desplegar (ver README).
+      ddl-auto: ${JPA_DDL_AUTO:update}
     show-sql: false
     properties:
       hibernate:
@@ -32,46 +34,26 @@ spring:
         order_updates: true
 
   # ── KAFKA ──────────────────────────────────────────────────────────────────
+  # El CONSUMER no se configura aquí: lo construye KafkaConsumerConfig (deserializa
+  # como String y convierte a JSON por tipo de parámetro; lee KAFKA_BOOTSTRAP_SERVERS
+  # y SPRING_KAFKA_CONSUMER_GROUP_ID directamente del entorno).
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
-    consumer:
-      group-id: ${SPRING_KAFKA_CONSUMER_GROUP_ID:payment-orchestrator-group}
-      auto-offset-reset: earliest
-      enable-auto-commit: false
-      max-poll-records: 100
-      session-timeout-ms: 10000
-      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
-      properties:
-        spring:
-          json:
-            trusted:
-              packages: "com.finnode.*"
     producer:
       bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
       acks: all
       retries: 3
-    listener:
-      concurrency: 3
 
   # ── SECURITY: Resource Server JWT ─────────────────────────────────────────
+  # El mismo JwtDecoder valida el REST y el handshake del WebSocket (/ws/payments?token=...)
   security:
     oauth2:
       resourceserver:
         jwt:
           issuer-uri: ${JWT_ISSUER_URI:http://auth-service:8081}
           jwk-set-uri: ${JWT_JWK_SET_URI:http://localhost:8081/.well-known/jwks.json}
-
-  # ── AI / OPENAI ───────────────────────────────────────────────────────────
-  ai:
-    openai:
-      api-key: ${OPENAI_API_KEY}
-      chat:
-        options:
-          model: gpt-4o-mini
-          temperature: 0.1
 
 # ── SERVIDOR ────────────────────────────────────────────────────────────────
 server:
@@ -86,10 +68,17 @@ feign:
         connectTimeout: 3000
         readTimeout: 5000
 
-# ── FRAUDE ───────────────────────────────────────────────────────────────────
-fraud:
-  risk-threshold: ${FRAUD_RISK_THRESHOLD:0.75}
-  system-prompt: "Eres un experto en detección de fraude. Analiza transacciones y responde siempre en JSON con: {\"approved\": boolean, \"riskScore\": 0.0-1.0, \"reason\": string}"
+# ── SAGA ─────────────────────────────────────────────────────────────────────
+# La evaluación de fraude la hace el microservicio fraud-engine (vía Kafka);
+# aquí solo se define cuánto espera el orquestador.
+# ⏳ Los leerá SagaTimeoutScheduler (aún no implementado).
+saga:
+  fraud-check-timeout-seconds: ${FRAUD_CHECK_TIMEOUT_SECONDS:10}   # sin respuesta → FRAUD_REJECTED (fail-closed)
+  ledger-timeout-seconds: ${LEDGER_TIMEOUT_SECONDS:30}             # sin asientos → compensación
+
+# ── WEBSOCKET ────────────────────────────────────────────────────────────────
+websocket:
+  allowed-origins: ${WEBSOCKET_ALLOWED_ORIGINS:*}   # en producción: restringir al dominio del frontend
 
 # ── LOGGING ─────────────────────────────────────────────────────────────────
 logging:

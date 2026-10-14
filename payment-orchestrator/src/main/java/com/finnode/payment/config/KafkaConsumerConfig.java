@@ -1,6 +1,8 @@
 package com.finnode.payment.config;
 
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.databind.json.JsonMapper;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.common.serialization.StringDeserializer;
@@ -17,6 +19,18 @@ import org.springframework.kafka.support.converter.StringJsonMessageConverter;
 import java.util.HashMap;
 import java.util.Map;
 
+/**
+ * Configuración del consumer del orquestador.
+ *
+ * Los mensajes llegan como String y StringJsonMessageConverter los convierte al tipo del
+ * parámetro del @KafkaListener (no depende de cabeceras de tipo), por eso también sirve para
+ * eventos de servicios que no son Java, como fraud-engine (Python).
+ *
+ * Topics consumidos (ver PaymentEventConsumer):
+ *  - fraud.check-completed            (fraud-engine)
+ *  - account.funds-reserved / account.funds-reservation-failed / account.funds-released
+ *  - ledger.entries-recorded / ledger.recording-failed
+ */
 @EnableKafka
 @Configuration
 public class KafkaConsumerConfig {
@@ -38,9 +52,20 @@ public class KafkaConsumerConfig {
 		return new DefaultKafkaConsumerFactory<>(props);
 	}
 
+	/**
+	 * Cambios para fraud-engine y WebSocket:
+	 *  - FAIL_ON_UNKNOWN_PROPERTIES desactivado: si fraud-engine agrega campos al evento
+	 *    (ej. nuevas reglas), el orquestador no rechaza el mensaje.
+	 *  - WRITE_DATES_AS_TIMESTAMPS desactivado: Instant/LocalDateTime se escriben en ISO-8601
+	 *    (en el WebSocket y en las respuestas REST) en lugar de números/arrays.
+	 */
 	@Bean("kafkaObjectMapper")
 	public ObjectMapper kafkaObjectMapper() {
-		return JsonMapper.builder().findAndAddModules().build();
+		return JsonMapper.builder()
+				.findAndAddModules()
+				.disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
+				.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
+				.build();
 	}
 
 	@Bean
